@@ -1,8 +1,9 @@
-module github.com/go-bdd/gobdd
+module github.com/go-bdd/gobdd/v2
 
 go 1.17
 
 require (
+	github.com/cucumber/cucumber-expressions/go/v17 v17.1.0
 	github.com/cucumber/gherkin/go/v28 v28.0.0
 	github.com/cucumber/messages/go/v24 v24.1.0
 	github.com/go-bdd/assert v0.0.0-20200713105154-236f01430281

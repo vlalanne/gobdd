@@ -13,6 +13,7 @@ import (
 	"strings"
 	"testing"
 
+	cucumberexpressions "github.com/cucumber/cucumber-expressions/go/v17"
 	gherkin "github.com/cucumber/gherkin/go/v28"
 	msgs "github.com/cucumber/messages/go/v24"
 )
@@ -23,7 +24,7 @@ type Suite struct {
 	steps          []stepDef
 	options        SuiteOptions
 	hasStepErrors  bool
-	parameterTypes map[string][]string
+	parameterTypes cucumberexpressions.ParameterTypeRegistry
 }
 
 // SuiteOptions holds all the information about how the suite or features/steps should be configured
@@ -147,7 +148,7 @@ func WithIgnoredTags(tags ...string) func(*SuiteOptions) {
 }
 
 type stepDef struct {
-	expr *regexp.Regexp
+	expr interface{}
 	f    interface{}
 }
 
@@ -193,14 +194,19 @@ func NewSuite(t TestingT, optionClosures ...func(*SuiteOptions)) *Suite {
 		t:              t,
 		steps:          []stepDef{},
 		options:        options,
-		parameterTypes: map[string][]string{},
+		parameterTypes: *cucumberexpressions.NewParameterTypeRegistry(),
 	}
 
 	// see https://github.com/cucumber/cucumber-expressions/blob/main/go/parameter_type_registry.go
-	s.AddParameterTypes(`{int}`, []string{`(-?\d+)`})
-	s.AddParameterTypes(`{float}`, []string{`([-+]?\d*\.?\d+)`})
-	s.AddParameterTypes(`{word}`, []string{`([^\s]+)`})
-	s.AddParameterTypes(`{text}`, []string{`"([^"\\]*(?:\\.[^"\\]*)*)"`, `'([^'\\]*(?:\\.[^'\\]*)*)'`})
+	stringParameter := s.parameterTypes.LookupByTypeName("string")
+	s.AddParameterRegexTypes(
+		`text`,
+		stringParameter.Regexps(),
+		stringParameter.Type(),
+		func(s ...*string) interface{} {
+			return stringParameter.Transform(s)
+		},
+	)
 
 	return s
 }
@@ -213,14 +219,48 @@ func NewSuite(t TestingT, optionClosures ...func(*SuiteOptions)) *Suite {
 //	s.AddParameterTypes(`{int}`, []string{`(\d)`})
 //
 // The regular expression should compile, otherwise will produce an error and stop executing.
-func (s *Suite) AddParameterTypes(from string, to []string) {
-	for _, to := range to {
-		_, err := regexp.Compile(to)
+func (s *Suite) AddParameterTypes(from string, to []string, type1 string, transform func(...*string) interface{}) {
+	toRegex := make([]*regexp.Regexp, len(to))
+
+	for i, to := range to {
+		regex, err := regexp.Compile(to)
 		if err != nil {
 			s.t.Fatalf(`the regular expression for key %s doesn't compile: %s`, from, to)
 		}
 
-		s.parameterTypes[from] = append(s.parameterTypes[from], to)
+		toRegex[i] = regex
+	}
+
+	s.AddParameterRegexTypes(
+		from,
+		toRegex,
+		type1,
+		transform,
+	)
+}
+
+func (s *Suite) AddParameterRegexTypes(
+	from string,
+	to []*regexp.Regexp,
+	type1 string,
+	transform func(...*string) interface{},
+) {
+	parameterType, err := cucumberexpressions.NewParameterType(
+		from,
+		to,
+		type1,
+		transform,
+		false,
+		false,
+		false,
+	)
+	if err != nil {
+		s.t.Fatalf(`failed to create parameter type: %s`, from)
+	}
+
+	err = s.parameterTypes.DefineParameterType(parameterType)
+	if err != nil {
+		s.t.Fatalf(`failed to define parameter type: %s`, from)
 	}
 }
 
@@ -235,7 +275,29 @@ func (s *Suite) AddParameterTypes(from string, to []string) {
 //	func myStepFunction(t gobdd.StepTest, ctx gobdd.Context, first int, second int) {
 //	}
 func (s *Suite) AddStep(expr string, step interface{}) {
-	err := validateStepFunc(step)
+	if len(expr) > 0 && expr[0] == '^' && expr[len(expr)-1] == '$' {
+		compiled, err := regexp.Compile(expr)
+		if err != nil {
+			s.t.Errorf("the step expression is an invalid regex: %w", err)
+			s.hasStepErrors = true
+
+			return
+		}
+
+		s.AddRegexStep(compiled, step)
+
+		return
+	}
+
+	expression, err := cucumberexpressions.NewCucumberExpression(expr, &s.parameterTypes)
+	if err != nil {
+		s.t.Errorf("the step expression is an invalid cucumber expression: %w", err)
+		s.hasStepErrors = true
+
+		return
+	}
+
+	err = validateStepFunc(step)
 	if err != nil {
 		s.t.Errorf("the step function for step `%s` is incorrect: %w", expr, err)
 		s.hasStepErrors = true
@@ -243,36 +305,10 @@ func (s *Suite) AddStep(expr string, step interface{}) {
 		return
 	}
 
-	exprs := s.applyParameterTypes(expr)
-
-	for _, expr := range exprs {
-		compiled, err := regexp.Compile(expr)
-		if err != nil {
-			s.t.Errorf("the step function is incorrect: %w", err)
-			s.hasStepErrors = true
-
-			return
-		}
-
-		s.steps = append(s.steps, stepDef{
-			expr: compiled,
-			f:    step,
-		})
-	}
-}
-
-func (s *Suite) applyParameterTypes(expr string) []string {
-	exprs := []string{expr}
-
-	for from, to := range s.parameterTypes {
-		for _, t := range to {
-			if strings.Contains(expr, from) {
-				exprs = append(exprs, s.applyParameterTypes(strings.ReplaceAll(expr, from, t))...)
-			}
-		}
-	}
-
-	return exprs
+	s.steps = append(s.steps, stepDef{
+		expr: expression,
+		f:    step,
+	})
 }
 
 // AddRegexStep registers a step in the suite.
@@ -430,16 +466,7 @@ func (s *Suite) stepsFromExamples(
 
 	for _, row := range example.TableBody {
 		// iterate over the cells and update the text
-		stepText, expr := s.stepFromExample(text, row, placeholdersValues)
-
-		// find step definition for the new step
-		def, err := s.findStepDef(stepText)
-		if err != nil {
-			continue
-		}
-
-		// add the step to the list
-		s.AddStep(expr, def.f)
+		stepText := s.stepFromExample(text, row, placeholdersValues)
 
 		// clone a step
 		step := &msgs.Step{
@@ -460,16 +487,12 @@ func (s *Suite) stepsFromExamples(
 
 func (s *Suite) stepFromExample(
 	stepName string,
-	row *msgs.TableRow, placeholders []string) (string, string) {
-	expr := stepName
-
+	row *msgs.TableRow, placeholders []string) string {
 	for i, ph := range placeholders {
-		t := getRegexpForVar(row.Cells[i].Value)
-		expr = strings.ReplaceAll(expr, ph, t)
 		stepName = strings.ReplaceAll(stepName, ph, row.Cells[i].Value)
 	}
 
-	return stepName, expr
+	return stepName
 }
 
 func (s *Suite) callBeforeScenarios(ctx Context) {
@@ -569,12 +592,7 @@ func (s *Suite) runStep(ctx Context, t *testing.T, step *msgs.Step) {
 
 	def, err := s.findStepDef(step.Text)
 	if err != nil {
-		t.Fatalf("cannot find step definition for step: %s%s", step.Keyword, step.Text)
-	}
-
-	params := def.expr.FindSubmatch([]byte(step.Text))[1:]
-	if step.DocString != nil {
-		params = append(params, []byte(step.DocString.Content))
+		t.Fatalf("cannot find step definition for step: %s%s, %s", step.Keyword, step.Text, err.Error())
 	}
 
 	t.Run(fmt.Sprintf("%s %s", strings.TrimSpace(step.Keyword), step.Text), func(t *testing.T) {
@@ -584,21 +602,43 @@ func (s *Suite) runStep(ctx Context, t *testing.T, step *msgs.Step) {
 
 		s.callBeforeSteps(ctx)
 		defer s.callAfterSteps(ctx)
-
-		def.run(ctx, t, params)
+		def.run(ctx, t, step)
 	})
 }
 
-func (def *stepDef) run(ctx Context, t TestingT, params [][]byte) { // nolint:interfacer
+func (def *stepDef) run(ctx Context, t TestingT, step *msgs.Step) {
 	defer func() {
 		if r := recover(); r != nil {
 			t.Errorf("%+v", r)
 		}
 	}()
 
+	switch expr := def.expr.(type) {
+	case *regexp.Regexp:
+		def.runRegexStep(ctx, t, step, expr)
+	case cucumberexpressions.Expression:
+		def.runExpressionStep(ctx, t, step, expr)
+	default:
+		t.Fatal("Unknown expression type")
+	}
+}
+
+func (def *stepDef) runRegexStep(ctx Context, t TestingT, step *msgs.Step, expr *regexp.Regexp) {
+	params := expr.FindSubmatch([]byte(step.Text))[1:]
+	if step.DocString != nil {
+		params = append(params, []byte(step.DocString.Content))
+	}
+
 	d := reflect.ValueOf(def.f)
+
 	if len(params)+2 != d.Type().NumIn() {
-		t.Fatalf("the step function %s accepts %d arguments but %d received", d.String(), d.Type().NumIn(), len(params)+2)
+		t.Fatalf(
+			"the step function %s accepts %d arguments but %d received: %s",
+			d.String(),
+			d.Type().NumIn(),
+			len(params)+2,
+			params,
+		)
 
 		return
 	}
@@ -613,6 +653,53 @@ func (def *stepDef) run(ctx Context, t TestingT, params [][]byte) { // nolint:in
 		inType := d.Type().In(i + 2)
 		paramType := paramType(v, inType)
 		in = append(in, paramType)
+	}
+
+	d.Call(in)
+}
+
+func (def *stepDef) runExpressionStep(
+	ctx Context,
+	t TestingT,
+	step *msgs.Step,
+	expr cucumberexpressions.Expression,
+) {
+	d := reflect.ValueOf(def.f)
+	typeHints := []reflect.Type{}
+
+	for i := 2; i < d.Type().NumIn(); i++ {
+		typeHints = append(typeHints, d.Type().In(i))
+	}
+
+	params, err := expr.Match(step.Text, typeHints...)
+	if err != nil {
+		t.Fatalf("failed to parse arguments")
+	}
+
+	parameterNumber := len(params)
+	if step.DocString != nil {
+		parameterNumber++
+	}
+
+	if parameterNumber+2 != d.Type().NumIn() {
+		t.Fatalf(
+			"the step function %s accepts %d arguments but %d received",
+			d.String(),
+			d.Type().NumIn(),
+			parameterNumber+2,
+		)
+
+		return
+	}
+
+	in := []reflect.Value{reflect.ValueOf(t), reflect.ValueOf(ctx)}
+
+	for _, param := range params {
+		in = append(in, reflect.ValueOf(param.GetValue()))
+	}
+
+	if step.DocString != nil {
+		in = append(in, reflect.ValueOf(step.DocString.Content))
 	}
 
 	d.Call(in)
@@ -651,13 +738,24 @@ func (s *Suite) findStepDef(text string) (stepDef, error) {
 	found := 0
 
 	for _, step := range s.steps {
-		if !step.expr.MatchString(text) {
-			continue
-		}
+		switch expr := step.expr.(type) {
+		case *regexp.Regexp:
+			if !expr.MatchString(text) {
+				continue
+			}
 
-		if l := len(step.expr.FindAll([]byte(text), -1)); l > found {
-			found = l
-			sd = step
+			if l := len(expr.FindAll([]byte(text), -1)); l > found {
+				found = l
+				sd = step
+			}
+
+		case cucumberexpressions.Expression:
+			if expr.Regexp().MatchString(text) {
+				sd = step
+			}
+
+		default:
+			return stepDef{}, fmt.Errorf("unknown expression type %T", expr)
 		}
 	}
 
@@ -716,18 +814,4 @@ func contains(a []string, x string) bool {
 	}
 
 	return false
-}
-
-func getRegexpForVar(v interface{}) string {
-	s := v.(string)
-
-	if _, err := strconv.Atoi(s); err == nil {
-		return "(\\d+)"
-	}
-
-	if _, err := strconv.ParseFloat(s, 32); err == nil {
-		return "([+-]?([0-9]*[.])?[0-9]+)"
-	}
-
-	return "(.*)"
 }

@@ -26,29 +26,30 @@ func TestRule(t *testing.T) {
 	suite.AddRegexStep(compiled, add)
 	compiled = regexp.MustCompile(`the result should equal (\d+)`)
 	suite.AddRegexStep(compiled, check)
+	suite.AddStep(`the result should equal {int}`, check)
 	suite.Run()
 }
 
 func TestAddStepWithRegexp(t *testing.T) {
 	suite := NewSuite(t, WithFeaturesPath("features/example.feature"))
-	suite.AddStep(`I add (\d+) and (\d+)`, add)
-	suite.AddStep(`the result should equal (\d+)`, check)
+	suite.AddStep(`^I add (\d+) and (\d+)$`, add)
+	suite.AddStep(`^the result should equal (\d+)$`, check)
 
 	suite.Run()
 }
 
 func TestDifferentFuncTypes(t *testing.T) {
 	suite := NewSuite(t, WithFeaturesPath("features/func_types.feature"))
-	suite.AddStep(`I add ([+-]?[0-9]*[.]?[0-9]+) and ([+-]?[0-9]*[.]?[0-9]+)`, addf)
-	suite.AddStep(`the result should equal ([+-]?[0-9]*[.]?[0-9]+)`, checkf)
+	suite.AddStep(`I add (floats ){float} and {float}`, addf)
+	suite.AddStep(`the result should equal {float}`, checkf)
 
 	suite.Run()
 }
 
 func TestScenarioOutline(t *testing.T) {
 	suite := NewSuite(t, WithFeaturesPath("features/outline.feature"))
-	suite.AddStep(`I add (\d+) and (\d+)`, add)
-	suite.AddStep(`the result should equal (\d+)`, check)
+	suite.AddStep(`I add {int} and {int}`, add)
+	suite.AddStep(`the result should equal {int}`, check)
 
 	suite.Run()
 }
@@ -87,8 +88,8 @@ func TestArguments(t *testing.T) {
 func TestScenarioOutlineExecutesAllTests(t *testing.T) {
 	c := 0
 	suite := NewSuite(t, WithFeaturesPath("features/outline.feature"))
-	suite.AddStep(`I add (\d+) and (\d+)`, add)
-	suite.AddStep(`the result should equal (\d+)`, func(t StepTest, ctx Context, sum int) {
+	suite.AddStep(`I add {int} and {int}`, add)
+	suite.AddStep(`the result should equal {int}`, func(t StepTest, ctx Context, sum int) {
 		c++
 		check(t, ctx, sum)
 	})
@@ -102,7 +103,7 @@ func TestScenarioOutlineExecutesAllTests(t *testing.T) {
 
 func TestStepFromExample(t *testing.T) {
 	s := NewSuite(t)
-	st, expr := s.stepFromExample("I add <d1> and <d2>", &msgs.TableRow{
+	st := s.stepFromExample("I add <d1> and <d2>", &msgs.TableRow{
 		Cells: []*msgs.TableCell{
 			{Value: "1"},
 			{Value: "2"},
@@ -116,18 +117,14 @@ func TestStepFromExample(t *testing.T) {
 	if err := assert.Equals("I add 1 and 2", st); err != nil {
 		t.Error(err)
 	}
-
-	if err := assert.Equals(`I add (\d+) and (\d+)`, expr); err != nil {
-		t.Error(err)
-	}
 }
 
 func TestBackground(t *testing.T) {
 	suite := NewSuite(t, WithFeaturesPath("features/background.feature"))
-	suite.AddStep(`I add (\d+) and (\d+)`, add)
+	suite.AddStep(`I add {int} and {int}`, add)
 	suite.AddStep(`I concat word {word} and text {text}`, concat)
 	suite.AddStep(`the result should equal text {text}`, checkt)
-	suite.AddStep(`the result should equal (\d+)`, check)
+	suite.AddStep(`the result should equal {int}`, check)
 
 	suite.Run()
 }
@@ -199,8 +196,8 @@ func TestWithAfterStep(t *testing.T) {
 			t.Errorf("expected scenario but got %T", scenario)
 		}
 	}))
-	suite.AddStep(`I add (\d+) and (\d+)`, add)
-	suite.AddStep(`the result should equal (\d+)`, check)
+	suite.AddStep(`I add {int} and {int}`, add)
+	suite.AddStep(`the result should equal {int}`, check)
 	suite.AddStep(`I concat word {word} and text {text}`, concat)
 	suite.AddStep(`the result should equal text {text}`, checkt)
 
@@ -216,8 +213,8 @@ func TestWithBeforeStep(t *testing.T) {
 	suite := NewSuite(t, WithFeaturesPath("features/background.feature"), WithBeforeStep(func(ctx Context) {
 		c++
 	}))
-	suite.AddStep(`I add (\d+) and (\d+)`, add)
-	suite.AddStep(`the result should equal (\d+)`, check)
+	suite.AddStep(`I add {int} and {int}`, add)
+	suite.AddStep(`the result should equal {int}`, check)
 	suite.AddStep(`I concat word {word} and text {text}`, concat)
 	suite.AddStep(`the result should equal text {text}`, checkt)
 
@@ -270,13 +267,18 @@ func TestFailureOutput(t *testing.T) {
 		{name: "returns error", f: failure, expectedErrors: []string{"the step failed"}},
 		{name: "step panics", f: panics, expectedErrors: []string{"the step panicked"}},
 	}
-
+	mockRegex, err := regexp.Compile("")
+	if err != nil {
+		t.Fatal(err)
+	}
 	for _, testCase := range testCases {
 		t.Run(testCase.name, func(t *testing.T) {
-			def := stepDef{f: testCase.f}
+			def := stepDef{f: testCase.f, expr: mockRegex}
 
 			tester := &mockTester{}
-			def.run(NewContext(), tester, nil)
+			def.run(NewContext(), tester, &msgs.Step{
+				Text: "",
+			})
 			err := assert.Equals(testCase.expectedErrors, tester.errors)
 			if err != nil {
 				t.Fatal(err)

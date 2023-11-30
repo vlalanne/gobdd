@@ -3,8 +3,8 @@ package gobdd_test
 import (
 	"testing"
 
-	gobdd "github.com/go-bdd/gobdd"
-	"github.com/go-bdd/gobdd/context"
+	"github.com/go-bdd/gobdd/v2/context"
+	"github.com/go-bdd/gobdd/v2"
 )
 
 func TestValidateStepFunc_Context(t *testing.T) {
